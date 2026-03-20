@@ -1,0 +1,347 @@
+name: kdev armbian build
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+
+env:
+  TZ: America/New_York
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # set_release: [ bullseye, bookworm, jammy, noble ]
+        set_release: [ bullseye, bookworm, jammy, noble, focal, forky, oracular, plucky, resolute, trixie ]
+        # bullseye	Debian 11	    Oldstable（旧稳定版）	2021年8月	安全支持将持续至 2026年6月（LTS）
+        # bookworm	Debian 12	    Stable（当前稳定版）	2023年6月	当前官方推荐稳定版本
+        # trixie	Debian 13	    Testing（测试版）	预计 2025 年中发布	当前处于开发冻结前阶段
+        # forky	    Debian 14	    Unstable（未来开发版）	尚未发布	在 sid 之后的下一个开发代号
+        # focal	    Ubuntu 20.04	LTS（长期支持）	2020年4月	标准支持已于 2025年4月结束；需 Ubuntu Pro 获取扩展安全维护（ESM）
+        # jammy	    Ubuntu 22.04	LTS	2022年4月	免费支持至 2027年4月（桌面/服务器）
+        # noble	    Ubuntu 24.04	LTS	2024年4月	最新 LTS，支持至 2029年4月
+        # oracular	Ubuntu 24.10	普通版（非LTS）	2024年10月	支持至 2025年7月（仅9个月）
+        # plucky	Ubuntu 25.04	普通版（计划）	预计 2025年4月	尚未发布，开发代号
+        # resolute	Ubuntu 25.10	普通版（计划）	预计 2025年10月	未来版本，已公布代号
+        set_desktop: [ cli, gnome, xfce ]
+        exclude:
+          - set_release: bullseye
+            set_desktop: gnome
+          - set_release: bullseye
+            set_desktop: xfce
+
+    if: ${{ github.event.repository.owner.id }} == ${{ github.event.sender.id }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialization environment
+        id: init
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          docker rmi $(docker images -q) 2>/dev/null
+          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
+          sudo rm -rf /usr/share/dotnet /etc/apt/sources.list.d /usr/local/lib/android 2>/dev/null
+          sudo swapoff -a
+          sudo rm -f /swapfile /mnt/swapfile
+          sudo -E apt-get -y update
+          sudo -E apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
+          sudo -E apt-get -y install python2 python2-dev python-is-python3 squashfs-tools rar $(curl -fsSL https://tinyurl.com/ubuntu2204-build-armbian) u-boot-tools gcc-aarch64-linux-gnu
+          sudo -E systemctl daemon-reload
+          #sudo -E apt-get -y full-upgrade
+          sudo -E apt-get -y autoremove --purge
+          sudo -E apt-get clean
+          sudo sed -i '/NVM_DIR/d;/skel/d' /root/{.bashrc,.profile}
+          sudo rm -rf ~/{.cargo,.dotnet,.rustup}
+          sudo timedatectl set-timezone "${TZ}"
+          # init output prefix  ${{ steps.init.outputs.build_tag }}
+          echo "build_tag=Armbian_ea_3588s_${{ matrix.set_release }}_5.10.226_${{ matrix.set_desktop }}" >> ${GITHUB_OUTPUT}
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Create simulated physical disk
+        run: |
+          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 1)
+          root_size=$(expr $(df -h / | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 4)
+          sudo truncate -s "${mnt_size}"G /mnt/mnt.img
+          sudo truncate -s "${root_size}"G /root.img
+          sudo losetup /dev/loop6 /mnt/mnt.img
+          sudo losetup /dev/loop7 /root.img
+          sudo pvcreate /dev/loop6
+          sudo pvcreate /dev/loop7
+          sudo vgcreate github /dev/loop6 /dev/loop7
+          sudo lvcreate -n runner -l 100%FREE github
+          sudo mkfs.xfs /dev/github/runner
+          sudo mkdir -p /builder
+          sudo mount /dev/github/runner /builder
+          sudo chown -R runner.runner /builder
+          df -Th
+
+      - name: Download Git Repository
+        id: down_d3588
+        working-directory: /builder/
+        if: ${{ steps.init.outputs.status }} == 'success' && !cancelled()
+        run: |
+          df -hT ${PWD}
+          git clone --recursive --single-branch --branch=master https://github.com/yifengyou/ea_3588s.git ea_3588s.git
+          ls -alh ea_3588s.git
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Compile u-boot-v2017 for ea_3588s
+        id: compile_d3588_uboot
+        working-directory: /builder/ea_3588s.git/u-boot-v2017
+        if: ${{ steps.copy_template.outputs.status }} == 'success' && !cancelled()
+        run: |
+          ./ea3588s.sh
+          md5sum ../rockdev/uboot.img
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Compile kernel-5.10.226 for ea_3588s
+        id: compile_d3588_kernel
+        working-directory: /builder/ea_3588s.git/kernel-5.10.226
+        if: ${{ steps.compile_d3588_uboot.outputs.status }} == 'success' && !cancelled()
+        run: |
+          ./ea3588s.sh
+          md5sum ../rockdev/boot.img
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Download armbian source code
+        id: down_armbian
+        working-directory: /builder/
+        if: ${{ steps.compile_d3588_kernel.outputs.status }} == 'success' && !cancelled()
+        run: |
+          set -x
+          git clone -q --single-branch \
+            --depth=1 \
+            --branch=main \
+            https://github.com/armbian/build.git armbian.git
+          ls -alh armbian.git
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Compile Armbian [ ${{ matrix.set_release }} ] [ ${{ matrix.set_desktop }} ]
+        id: compile_armbian
+        working-directory: /builder/armbian.git
+        if: ${{ steps.down_armbian.outputs.status }} == 'success' && !cancelled()
+        run: |
+          if [ "${{ matrix.set_desktop }}" == "cli" ] ; then
+            BUILD_DESKTOP="BUILD_DESKTOP=no"
+          else
+            BUILD_DESKTOP=" \
+                BUILD_DESKTOP=yes \
+                DESKTOP_APPGROUPS_SELECTED=remote_desktop \
+                DESKTOP_ENVIRONMENT=${{ matrix.set_desktop }} \
+                DESKTOP_ENVIRONMENT_CONFIG_NAME=config_base"
+          fi
+          # BRANCH=edge    : newest kernel such as 6.10
+          # BRANCH=current : stable kernel such as 6.6
+          # BRANCH=legacy  : vendor kernel rockchip 5.10
+          ./compile.sh RELEASE=${{ matrix.set_release }} \
+                       BOARD=nanopct6 \
+                       BRANCH=current \
+                       BUILD_MINIMAL=no \
+                       BUILD_ONLY=default \
+                       HOST=armbian \
+                       ${BUILD_DESKTOP} \
+                       EXPERT=yes \
+                       KERNEL_CONFIGURE=no \
+                       COMPRESS_OUTPUTIMAGE="sha,img,xz" \
+                       VENDOR="Armbian" \
+                       SHARE_LOG=yes
+          ls -alh /builder/armbian.git/output/images/
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Extract rootfs from Armbian
+        id: extract_rootfs
+        working-directory: /builder/ea_3588s.git
+        if: ${{ steps.compile_armbian.outputs.status }} == 'success' && !cancelled()
+        run: |
+          chmod +x /builder/ea_3588s.git/tools/extract-rootfs-from-armbian.sh
+          /builder/ea_3588s.git/tools/extract-rootfs-from-armbian.sh /builder/armbian.git/output/images/
+          ls -alh /builder/armbian.git/output/images/rootfs.img
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Hack rootfs
+        id: hack_rootfs
+        working-directory: /builder/armbian.git/output/images/
+        if: ${{ steps.extract_rootfs.outputs.status }} == 'success' && !cancelled()
+        run: |
+          # hack rootfs, must start with sudo
+          sudo mount rootfs.img /mnt
+          sudo cp -a /builder/ea_3588s.git/tools/hack-rootfs.sh /mnt/
+          sudo cp -a /builder/ea_3588s.git/tools/armbian_first_run.txt /mnt/boot/
+          sudo chmod +x /mnt/hack-rootfs.sh
+          sudo chroot /mnt sh -c "/hack-rootfs.sh"
+          sync
+          sudo umount /mnt
+          mkdir -p /builder/ea_3588s.git/release
+          mkdir -p /builder/ea_3588s.git/ouput-temp/
+
+          cp -a /builder/ea_3588s.git/template/* /builder/ea_3588s.git/ouput-temp/
+          cp -a /builder/ea_3588s.git/rockdev/uboot.img /builder/ea_3588s.git/ouput-temp/
+          cp -a /builder/ea_3588s.git/rockdev/boot.img /builder/ea_3588s.git/ouput-temp/
+          mv /builder/armbian.git/output/images/rootfs.img /builder/ea_3588s.git/ouput-temp/
+
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Generate updatable image
+        id: generate_updateable_image
+        working-directory: /builder/ea_3588s.git/
+        if: ${{ steps.hack_rootfs.outputs.status }} == 'success' && !cancelled()
+        run: |
+          # rootfs.img   : /builder/ea_3588s.git/ouput-temp/rootfs.img
+          # uboot.img    : /builder/ea_3588s.git/ouput-temp/uboot.img
+          # boot.img     : /builder/ea_3588s.git/ouput-temp/boot.img
+          # RKDevTool    : /builder/ea_3588s.git/tools/RKDevTool
+          # afptool      : /builder/ea_3588s.git/tools/afptool
+          # rkImageMaker : /builder/ea_3588s.git/tools/rkImageMaker
+          # template     : /builder/ea_3588s.git/ouput-temp
+
+
+          mkdir -p /builder/ea_3588s.git/release
+          mkdir -p /builder/ea_3588s.git/output-updatable-image
+          # copy RKDevTool
+          cp -a /builder/ea_3588s.git/tools/RKDevTool /builder/ea_3588s.git/output-updatable-image/
+          mkdir -p /builder/ea_3588s.git/output-updatable-image/RKDevTool/rockdev/image/
+          # copy template
+          cp -a  /builder/ea_3588s.git/ouput-temp/* \
+            /builder/ea_3588s.git/output-updatable-image/RKDevTool/rockdev/image/
+
+          chmod +x /builder/ea_3588s.git/tools/afptool
+          chmod +x /builder/ea_3588s.git/tools/rkImageMaker
+          cd /builder/ea_3588s.git/output-updatable-image/RKDevTool/rockdev/image/
+          /builder/ea_3588s.git/tools/afptool -pack . temp.img
+          /builder/ea_3588s.git/tools/rkImageMaker -RK3588 MiniLoaderAll.bin temp.img update.img -os_type:androidos
+          find . -type f ! -name "update.img" -exec rm -f {} \;
+
+          # generate update.img
+          cd /builder/ea_3588s.git/output-updatable-image/
+          mksquashfs RKDevTool  /builder/ea_3588s.git/release/${{ steps.init.outputs.build_tag }}_update.img.squashfs && \
+          rar a /builder/ea_3588s.git/release/${{ steps.init.outputs.build_tag }}_update.img.rar RKDevTool
+          sha256sum /builder/ea_3588s.git/release/${{ steps.init.outputs.build_tag }}_update.img.squashfs > \
+            /builder/ea_3588s.git/release/${{ steps.init.outputs.build_tag }}_update.img.squashfs.sha256
+          sha256sum /builder/ea_3588s.git/release/${{ steps.init.outputs.build_tag }}_update.img.rar > \
+            /builder/ea_3588s.git/release/${{ steps.init.outputs.build_tag }}_update.img.rar.sha256
+
+      - name: Generate rockdev image
+        id: generate_rockdev_image
+        working-directory: /builder/ea_3588s.git/
+        if: ${{ steps.generate_updateable_image.outputs.status }} == 'success' && !cancelled()
+        run: |
+          # rootfs.img   : /builder/ea_3588s.git/ouput-temp/rootfs.img
+          # uboot.img    : /builder/ea_3588s.git/ouput-temp/uboot.img
+          # boot.img     : /builder/ea_3588s.git/ouput-temp/boot.img
+          # RKDevTool    : /builder/ea_3588s.git/tools/RKDevTool
+          # afptool      : /builder/ea_3588s.git/tools/afptool
+          # rkImageMaker : /builder/ea_3588s.git/tools/rkImageMaker
+          # template     : /builder/ea_3588s.git/ouput-temp
+
+          mkdir -p /builder/ea_3588s.git/release
+          mkdir -p /builder/ea_3588s.git/output-rockdev-image
+          # copy RKDevTool
+          cp -a /builder/ea_3588s.git/tools/RKDevTool /builder/ea_3588s.git/output-rockdev-image/
+          mkdir -p /builder/ea_3588s.git/output-rockdev-image/RKDevTool/rockdev/image/
+          # copy template
+          cp -a  /builder/ea_3588s.git/ouput-temp/* \
+            /builder/ea_3588s.git/output-rockdev-image/RKDevTool/rockdev/image/
+
+          # generate rockdev.img
+          cd /builder/ea_3588s.git/output-rockdev-image/
+          mksquashfs RKDevTool  /builder/ea_3588s.git/release/${{ steps.init.outputs.build_tag }}_rockdev.img.squashfs && \
+          rar a /builder/ea_3588s.git/release/${{ steps.init.outputs.build_tag }}_rockdev.img.rar RKDevTool
+          sha256sum /builder/ea_3588s.git/release/${{ steps.init.outputs.build_tag }}_rockdev.img.squashfs > \
+            /builder/ea_3588s.git/release/${{ steps.init.outputs.build_tag }}_rockdev.img.squashfs.sha256
+          sha256sum /builder/ea_3588s.git/release/${{ steps.init.outputs.build_tag }}_rockdev.img.rar > \
+            /builder/ea_3588s.git/release/${{ steps.init.outputs.build_tag }}_rockdev.img.rar.sha256
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Upload Image to Release
+        uses: ncipollo/release-action@main
+        if: ${{ steps.generate_rockdev_image.outputs.status }} == 'success' && !cancelled()
+        with:
+          tag: Armbian_EA_3588S_Image_5.10.226
+          artifacts: /builder/ea_3588s.git/release/*
+          allowUpdates: true
+          removeArtifacts: false
+          replacesArtifacts: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ### ea_3588s镜像说明
+
+            **For kdev, just for fun**
+
+            1. 镜像命名规则
+            以 * Armbian_EA_3588S_noble_5.10.226_cli_rockdev.img.rar** 为例
+
+            - "Armbian_ea_3588s" 固定前缀
+            - "noble" 发行版，可选 (bullseye, bookworm, jammy, noble, focal, forky, oracular, plucky, resolute, trixie)
+            - "5.10.226" 内核版本号
+            - "cli" 桌面环境，可选 (cli,xfce,gnome)
+            - "rockdev" 镜像类型，包括一下三种类型
+              - rockdev: RKDevTool + 多个小image镜像（uboot.img、boot.img、rootfs.img等）
+              - update : RKdevTool + update.img
+              - rootfs : 仅rootfs镜像
+
+            2. 系统密码
+
+            - 用户名: root   密码: 1234
+            - 用户名: admin  密码: admin
+            - 用户名: teamhd 密码: teamhd
+            - 用户名: linaro 密码: linaro
+
+            3. rockdev构建输出(rockdev.squashfs/rockdev.rar)
+
+            带windows更新工具RKDevTool，开箱即用。包含以下目录结构，windows下载后解压，执行RKDevTool.exe即可。
+            ```
+            RKDevTool/
+            ├── bin
+            │         ├── adb.exe
+            │         ├── AdbWinApi.dll
+            │         ├── AdbWinUsbApi.dll
+            │         ├── AFPTool.exe
+            │         └── RKImageMaker.exe
+            ├── config.cfg
+            ├── config.ini
+            ├── Language
+            │         ├── Chinese.ini
+            │         └── English.ini
+            ├── RKDevTool.exe
+            └── rockdev
+                └── image
+                    ├── boot.img
+                    ├── MiniLoaderAll.bin
+                    ├── misc.img
+                    ├── modules.tar.gz
+                    ├── oem.img
+                    ├── package-file
+                    ├── parameter.txt
+                    ├── recovery.img
+                    ├── rootfs.img
+                    └── uboot.img
+            ```
+
+            4. update镜像构建输出(update.img.squashfs/update.img.rar)
+
+            解压后输出update.img镜像，请使用 RKDevTool.exe 固件更新
+
+            ```
+            RKDevTool/
+            ├── bin
+            │         ├── adb.exe
+            │         ├── AdbWinApi.dll
+            │         ├── AdbWinUsbApi.dll
+            │         ├── AFPTool.exe
+            │         └── RKImageMaker.exe
+            ├── config.cfg
+            ├── config.ini
+            ├── Language
+            │         ├── Chinese.ini
+            │         └── English.ini
+            ├── RKDevTool.exe
+            └── rockdev
+                └── image
+                    └── update.img
+            ```
